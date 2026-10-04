@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Radar Data Collector</title>
+<style>
+:root{--bg:#050a10;--panel:#0b1520;--text:#e8f0f5;--muted:#7a8f9e;--accent:#22d3ee;--border:rgba(34,211,238,.2);--ok:#34d399;--warn:#fbbf24}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);padding:14px;min-height:100vh;font-size:14px}
+h1{font-size:16px;color:var(--accent);margin-bottom:10px;font-weight:800}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+label{font-size:11px;color:var(--muted);display:block;margin-bottom:3px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+input,textarea{width:100%;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 11px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;outline:none;resize:vertical}
+input:focus,textarea:focus{border-color:var(--accent)}
+textarea{min-height:140px;line-height:1.4}
+.col{flex:1;min-width:220px}
+button{background:rgba(34,211,238,.15);border:1px solid var(--accent);color:var(--accent);padding:9px 14px;border-radius:8px;font-weight:800;cursor:pointer;font-size:13px;letter-spacing:.03em}
+button:active{background:rgba(34,211,238,.35)}
+button.ok{background:rgba(52,211,153,.15);border-color:var(--ok);color:var(--ok)}
+button.warn{background:rgba(251,191,36,.15);border-color:var(--warn);color:var(--warn)}
+.stats{font-size:11px;color:var(--muted);margin:6px 0;font-family:ui-monospace,monospace}
+.out{min-height:200px}
+.hint{font-size:10px;color:var(--muted);margin-top:4px;line-height:1.5}
+</style>
+</head>
+<body>
+
+<h1>📡 Radar Data Collector</h1>
+
+<div class="row">
+  <div class="col" style="max-width:180px">
+    <label>Канал (необов.)</label>
+    <input id="ch" placeholder="@radar_raketaa">
+  </div>
+  <div class="col" style="max-width:200px">
+    <label>Час (ISO / auto)</label>
+    <input id="ts" placeholder="auto">
+  </div>
+</div>
+
+<label>Повідомлення (одне на рядок, або розділяй порожнім рядком)</label>
+<textarea id="inp" placeholder="Відмічено пуски крилатих ракет типу «Бандероль» з Курська.
+За інформацією очікується масовий балістичний обстріл, ймовірні міста — Київ, Обухів.
+По Києву та Київщині ворог завершує підготовку до удару, очікується до 40 БР різних типів + до 100 РБпЛА."></textarea>
+
+<div class="row" style="margin-top:8px">
+  <button onclick="process()">▶ Обробити</button>
+  <button class="ok" onclick="copyOut()">📋 Копіювати</button>
+  <button class="warn" onclick="download()">💾 Завантажити .jsonl</button>
+  <button onclick="clearAll()">🗑 Очистити</button>
+</div>
+
+<div class="stats" id="stats">—</div>
+
+<label>Результат (JSONL для вставки в чат з ШІ)</label>
+<textarea id="out" class="out" readonly placeholder="Натисни Обробити…"></textarea>
+
+<div class="hint">
+  Формат виходу: <b>JSONL</b> — один JSON на рядок.<br>
+  Поля: <b>text, channel, ts, type, subtype, places[], count, stage, countdown, confidence</b>.<br>
+  Скопіюй весь текст → встав у чат — і я перетворю його в константи для карти.
+</div>
+
+<script>
+const TYPES = [
+  {re:/балістик|баллистик|балістич|баллистич|іскандер|искандер|кинжал|кінжал|кн[-\s]?23|kn[-\s]?23|циркон|zircon|3м22|орешник|48н6|с[-\s]?400|с[-\s]?300|с[-\s]?500/i, type:"ballistic", sub:null},
+  {re:/калібр|калибр|kalibr|3м14/i, type:"cruise", sub:"kalibr"},
+  {re:/х[-\s]?101|x[-\s]?101/i, type:"cruise", sub:"h101"},
+  {re:/х[-\s]?555|x[-\s]?555/i, type:"cruise", sub:"h555"},
+  {re:/х[-\s]?22|х[-\s]?32|x[-\s]?22|x[-\s]?32/i, type:"cruise", sub:"h22_32"},
+  {re:/оникс|оникс|oniks|p[-\s]?800/i, type:"cruise", sub:"oniks"},
+  {re:/бандерол|s[-\s]?8000/i, type:"cruise", sub:"banderol"},
+  {re:/крилат[аиі]?\s+ракет|крилата\s+ракет/i, type:"cruise", sub:null},
+  {re:/реактивн[а-яіїєґ]*\s*(шахед|геран|бпла|дрон)|реактивн[а-яіїєґ]*\s*бпла/i, type:"jet_drone", sub:null},
+  {re:/герань\s*-?\s*5|geran\s*-?\s*5/i, type:"uav", sub:"geran5"},
+  {re:/герань\s*-?\s*4|geran\s*-?\s*4/i, type:"uav", sub:"geran4"},
+  {re:/герань|geran/i, type:"uav", sub:"geran"},
+  {re:/шахед|shahed/i, type:"uav", sub:"shahed"},
+  {re:/бпла|дрон|беспилотник|безпілотник|рбпла/i, type:"uav", sub:null},
+  {re:/каб\b|kab\b|уаб\b/i, type:"kab", sub:null},
+  {re:/су[-\s]?57|су[-\s]?34|су[-\s]?35|су[-\s]?30/i, type:"aircraft", sub:"su"},
+  {re:/міг[-\s]?31|миг[-\s]?31|mig[-\s]?31/i, type:"aircraft", sub:"mig31k"},
+  {re:/ту[-\s]?95|ту[-\s]?160|ту[-\s]?22/i, type:"aircraft", sub:"strategic"}
+];
+
+const PLACE_MAP = [
+  {canonical:"Київ",            re:/\bкиїв|\bкиев|kyiv/i},
+  {canonical:"Київщина",        re:/київщин|киевщин/i},
+  {canonical:"Київська обл.",   re:/київськ|киевск/i},
+  {canonical:"Обухів",          re:/обухів|обухов/i},
+  {canonical:"Кременчук",       re:/кременчук/i},
+  {canonical:"Дніпро",          re:/дніпро|днепр/i},
+  {canonical:"Дніпропетровськ", re:/дніпропетровськ|днепропетровск/i},
+  {canonical:"Полтава",         re:/полтав/i},
+  {canonical:"Запоріжжя",       re:/запоріж|запорож/i},
+  {canonical:"Курськ",          re:/курськ|курск/i},
+  {canonical:"Брянськ",         re:/брянськ|брянск/i},
+  {canonical:"Бєлгород",        re:/бєлгород|белгород/i},
+  {canonical:"Воронеж",         re:/воронеж/i},
+  {canonical:"Ростов",          re:/ростов/i},
+  {canonical:"Крим",            re:/крим|крым/i},
+  {canonical:"Приморське",      re:/приморськ|приморск/i},
+  {canonical:"Азовське море",   re:/азовськ|азовск/i},
+  {canonical:"Чернігів",        re:/чернігів|чернигов/i},
+  {canonical:"Суми",            re:/\bсуми\b|\bсумськ|\bсумск/i},
+  {canonical:"Харків",          re:/харків|харьков|харьк/i},
+  {canonical:"Одеса",           re:/одес/i},
+  {canonical:"Миколаїв",        re:/миколаїв|николаев/i},
+  {canonical:"Херсон",          re:/херсон/i},
+  {canonical:"Львів",           re:/львів|львов/i},
+  {canonical:"Вінниця",         re:/вінниц|винниц/i},
+  {canonical:"Житомир",         re:/житомир/i},
+  {canonical:"Трипілля",        re:/трипіл|трипол/i},
+  {canonical:"Бровари",         re:/бровар/i},
+  {canonical:"Бориспіль",       re:/бориспол/i},
+  {canonical:"Ірпінь",          re:/ірпін|ирпен/i},
+  {canonical:"Буча",            re:/\bбуча\b|\bбучан/i},
+  {canonical:"Васильків",       re:/васильків|васильков/i},
+  {canonical:"Фастів",          re:/фастів|фастов/i},
+  {canonical:"Біла Церква",     re:/біла\s+церкв|белая\s+церков/i},
+  {canonical:"Славутич",        re:/славутич/i},
+  {canonical:"Вишгород",        re:/вишгород|вышгород/i},
+  {canonical:"Українка",        re:/українка|украинка/i},
+  {canonical:"Кропивницький",   re:/кропивницьк|кировоград/i},
+  {canonical:"Черкаси",         re:/черкас/i},
+  {canonical:"Рівне",           re:/\bрівне\b|\bровно\b/i},
+  {canonical:"Мукачево",        re:/мукачев/i},
+  {canonical:"Луцьк",           re:/\bлуцьк|\bлуцк/i},
+  {canonical:"Тернопіль",       re:/тернопол/i},
+  {canonical:"Івано-Франківськ",re:/івано[-\s]?франківськ|ивано[-\s]?франковск/i}
+];
+
+const STAGES = [
+  {re:/пуск|пуски|запуск|запуски|зліт|взлет|виліт|вилетів|старт/i, stage:"launch"},
+  {re:/очіку[єе]ться|готу[єe]ться|завершує підготовку|попередження|загроза|підготовк|готують|готуватим/i, stage:"warning"},
+  {re:/прил[іi]т|прилет|влуч[аи]нн|попадан|удар\s+по|влучив|пошкоджен|зруйнован|вибух(?!и)\b/i, stage:"impact"},
+  {re:/збит[тоя]|сбит[оы]|перехоплен|ліквідован|ликвидирован/i, stage:"shot"},
+  {re:/впав|упав|падає|падінн|втрачає висоту|уламк|обломк/i, stage:"falling"},
+  {re:/відбій|отбой|чисто|без загроз|небезпека минула/i, stage:"clear"}
+];
+
+function extractType(text){
+  for(const t of TYPES){ if(t.re.test(text)) return {type:t.type, sub:t.sub}; }
+  return {type:null, sub:null};
+}
+function extractStage(text){
+  for(const s of STAGES){ if(s.re.test(text)) return s.stage; }
+  return null;
+}
+function extractPlaces(text){
+  const found = [];
+  for(const p of PLACE_MAP){
+    if(p.re.test(text) && !found.includes(p.canonical)) found.push(p.canonical);
+  }
+  return found;
+}
+function extractCount(text){
+  let m = text.match(/до\s+(\d{1,4})/i); if(m) return {n:parseInt(m[1],10), approx:true};
+  m = text.match(/(\d{1,4})\s*(?:шт\.?|одиниц[ьі]?|ракет[иі]?|бр\b|кр\b|бпла|рбпла|шахед|геран|дрон|борт|літак|самолет)/i);
+  if(m) return {n:parseInt(m[1],10), approx:false};
+  m = text.match(/\b(\d{1,4})\s*[хx×]\s/i); if(m) return {n:parseInt(m[1],10), approx:false};
+  return {n:null, approx:false};
+}
+function needsCountdown(text){
+  return /іскандер|искандер|кинжал|кінжал|циркон|zircon|3м22|3m22|онікс|оникс|балістик|баллистик|балістич|баллистич|кн[-\s]?23|kn[-\s]?23|орешник|48н6|с[-\s]?400|с[-\s]?300/i.test(text);
+}
+function splitMessages(raw){
+  let parts = raw.split(/\n\s*\n|\n-{3,}\n/).map(s=>s.trim()).filter(Boolean);
+  if(parts.length === 1){
+    const lines = raw.split(/\n/).map(s=>s.trim()).filter(Boolean);
+    if(lines.length > 1 && lines.every(l=>l.length<300)) parts = lines;
+  }
+  return parts;
+}
+function process(){
+  const raw = document.getElementById("inp").value;
+  if(!raw.trim()){ alert("Введи повідомлення"); return; }
+  const ch = document.getElementById("ch").value.trim() || null;
+  const tsInp = document.getElementById("ts").value.trim();
+  const msgs = splitMessages(raw);
+  const now = tsInp || new Date().toISOString();
+  const out = [];
+  for(const text of msgs){
+    const t = extractType(text);
+    const st = extractStage(text);
+    const pl = extractPlaces(text);
+    const cn = extractCount(text);
+    const cd = needsCountdown(text);
+    const rec = {
+      text: text.replace(/\s+/g," ").trim(),
+      channel: ch,
+      ts: now,
+      type: t.type,
+      subtype: t.sub,
+      places: pl,
+      count: cn.n,
+      approx: cn.approx || undefined,
+      stage: st,
+      countdown: cd || undefined,
+      source: (/@\w+/.exec(text)||[])[0] || undefined
+    };
+    Object.keys(rec).forEach(k=>{ if(rec[k]===null||rec[k]===undefined||(Array.isArray(rec[k])&&!rec[k].length)) delete rec[k]; });
+    out.push(rec);
+  }
+  const lines = out.map(r=>JSON.stringify(r));
+  document.getElementById("out").value = lines.join("\n");
+  const stats = {
+    total: out.length,
+    types: {},
+    stages: {},
+    withPlace: out.filter(r=>r.places).length,
+    withCount: out.filter(r=>r.count).length,
+    countdown: out.filter(r=>r.countdown).length
+  };
+  out.forEach(r=>{ if(r.type) stats.types[r.type]=(stats.types[r.type]||0)+1; if(r.stage) stats.stages[r.stage]=(stats.stages[r.stage]||0)+1; });
+  document.getElementById("stats").textContent =
+    `Всього: ${stats.total} · типи: ${JSON.stringify(stats.types)} · стадії: ${JSON.stringify(stats.stages)} · з локацією: ${stats.withPlace} · з числом: ${stats.withCount} · з відліком: ${stats.countdown}`;
+}
+function copyOut(){
+  const t = document.getElementById("out");
+  if(!t.value){ alert("Спочатку Обробити"); return; }
+  t.select(); t.setSelectionRange(0, t.value.length);
+  navigator.clipboard.writeText(t.value).then(()=>{ alert("✅ Скопійовано"); }).catch(()=>{ document.execCommand("copy"); alert("✅ Скопійовано"); });
+}
+function download(){
+  const v = document.getElementById("out").value;
+  if(!v){ alert("Спочатку Обробити"); return; }
+  const blob = new Blob([v], {type:"application/jsonl"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "radar_messages_" + new Date().toISOString().slice(0,19).replace(/[:T]/g,"-") + ".jsonl";
+  a.click();
+}
+function clearAll(){
+  document.getElementById("inp").value = "";
+  document.getElementById("out").value = "";
+  document.getElementById("stats").textContent = "—";
+}
+</script>
+</body>
+</html>
